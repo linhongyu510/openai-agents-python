@@ -3286,3 +3286,105 @@ async def test_redis_session_operation_waiting_behind_close_raises():
                 task.cancel()
                 with suppress(asyncio.CancelledError, RuntimeError):
                     await task
+
+
+# --- Atomic whole-history replacement (issue #5329) -------------------------------
+
+
+async def test_atomic_replace_items_swaps_history_in_one_shot() -> None:
+    old = [{"role": "user", "content": f"old-{i}"} for i in range(5)]
+    new = [{"role": "assistant", "content": "compacted-summary"}]
+    session = await _create_test_session()
+    try:
+        await session.add_items(cast("list[TResponseInputItem]", old))
+        await session._atomic_replace_items(cast("list[TResponseInputItem]", new))
+        assert await session.get_items() == new
+    finally:
+        await session.clear_session()
+
+
+async def test_atomic_replace_items_can_empty_history() -> None:
+    session = await _create_test_session()
+    try:
+        await session.add_items(
+            cast("list[TResponseInputItem]", [{"role": "user", "content": "bye"}])
+        )
+        await session._atomic_replace_items([])
+        assert await session.get_items() == []
+    finally:
+        await session.clear_session()
+
+
+async def test_atomic_replace_items_preserves_ttl() -> None:
+    if not USE_FAKE_REDIS:
+        pytest.skip("TTL assertion needs a controlled fakeredis instance")
+    session = await _create_redis_session("ttl-replace", ttl=3600)
+    try:
+        await session.add_items(
+            cast("list[TResponseInputItem]", [{"role": "user", "content": "a"}])
+        )
+        await session._atomic_replace_items(
+            cast("list[TResponseInputItem]", [{"role": "assistant", "content": "b"}])
+        )
+        assert await session.get_items() == [{"role": "assistant", "content": "b"}]
+        pttl = await fake_redis.pttl(session._messages_key)
+        assert 0 < pttl <= 3600 * 1000
+    finally:
+        await session.clear_session()
+
+
+async def test_compaction_never_exposes_empty_history_to_readers() -> None:
+    """Regression for #5329: a concurrent reader must never see an empty session
+    while compaction rewrites the whole history. On the old clear-then-add path the
+    reader observed [] between the two writes; the atomic Redis swap removes that
+    window."""
+    from types import SimpleNamespace
+
+    from agents.memory.openai_responses_compaction_session import (
+        OpenAIResponsesCompactionSession,
+    )
+
+    class FakeResponses:
+        async def compact(self, **kwargs: Any) -> SimpleNamespace:
+            return SimpleNamespace(
+                usage=None,
+                output=[{"role": "assistant", "content": "compacted-summary"}],
+            )
+
+    session = await _create_test_session("compaction-atomic")
+    reader_observations: list[int] = []
+
+    original_clear = session.clear_session
+
+    async def spying_clear() -> None:
+        await original_clear()
+        # Stand in for a concurrent worker/request reading the same session key in
+        # the window between clear and the subsequent add.
+        reader_observations.append(await fake_redis.llen(session._messages_key))
+
+    client = SimpleNamespace(responses=FakeResponses())
+    compaction = OpenAIResponsesCompactionSession(
+        session_id=session.session_id,
+        underlying_session=session,
+        client=cast("Any", client),
+        model="gpt-4.1",
+        compaction_mode="input",
+    )
+    try:
+        await session.add_items(
+            cast(
+                "list[TResponseInputItem]",
+                [{"role": "user", "content": f"m{i}"} for i in range(20)],
+            )
+        )
+        if USE_FAKE_REDIS:
+            session.clear_session = spying_clear  # type: ignore[method-assign]
+        await compaction.run_compaction({"force": True, "compaction_mode": "input"})
+
+        # The atomic swap never calls clear_session, so no reader window was observed.
+        assert reader_observations == []
+        final_items = await session.get_items()
+        assert final_items == [{"role": "assistant", "content": "compacted-summary"}]
+    finally:
+        session.clear_session = original_clear  # type: ignore[method-assign]
+        await session.clear_session()

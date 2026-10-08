@@ -481,8 +481,15 @@ class RedisSession(SessionABC):
         keys: tuple[str, str, str],
         serialized_items: list[str] | None,
         completion_owned: asyncio.Event,
+        replace: bool = False,
     ) -> _PipelineAttemptOutcome:
-        """Run one watched append or clear attempt and finish its pipeline."""
+        """Run one watched append, replace, or clear attempt and finish its pipeline.
+
+        When ``serialized_items`` is None the session is cleared. Otherwise the items
+        are appended; when ``replace`` is also true the existing messages list is
+        deleted inside the same transaction before the new items are pushed, so a
+        whole-history replacement is visible to readers as an all-or-nothing switch.
+        """
         committed = False
         retryable_watch_conflict = False
         operation_error: BaseException | None = None
@@ -559,8 +566,14 @@ class RedisSession(SessionABC):
                 else:
                     pipe.hset(self._session_key, "session_id", self.session_id)
                     pipe.hsetnx(self._session_key, "created_at", now)
-                    batch_response_index = len(pipe.command_stack)
-                    pipe.rpush(self._messages_key, *serialized_items)
+                    if replace:
+                        # Whole-history replacement: drop the old list inside the
+                        # same transaction as the new push so readers never see an
+                        # empty list and a crash leaves the old history intact.
+                        pipe.delete(self._messages_key)
+                    if serialized_items:
+                        batch_response_index = len(pipe.command_stack)
+                        pipe.rpush(self._messages_key, *serialized_items)
                     pipe.hset(self._session_key, "updated_at", now)
                     if expiration_time_ms is not None:
                         for key in keys:
@@ -605,14 +618,18 @@ class RedisSession(SessionABC):
     async def _mutate_items(
         self,
         serialized_items: list[str] | None,
+        *,
+        replace: bool = False,
     ) -> None:
-        """Atomically append a batch, or clear for None, after validating key types."""
+        """Atomically append a batch, replace the whole list, or clear for None."""
         keys = (self._session_key, self._messages_key, self._counter_key)
         while True:
             pipe = self._redis.pipeline()
             completion_owned = asyncio.Event()
             attempt = asyncio.create_task(
-                self._mutate_items_attempt(pipe, keys, serialized_items, completion_owned)
+                self._mutate_items_attempt(
+                    pipe, keys, serialized_items, completion_owned, replace=replace
+                )
             )
             outcome, cancellation = await _await_pipeline_attempt(attempt, completion_owned)
 
@@ -704,6 +721,28 @@ class RedisSession(SessionABC):
                 serialized_items.append(serialized)
 
             await self._mutate_items(serialized_items)
+
+    async def _atomic_replace_items(self, items: list[TResponseInputItem]) -> None:
+        """Atomically replace the entire stored history with ``items``.
+
+        This is the backend-side counterpart to ``Session.add_items`` intended for
+        history rewriting (e.g. compaction). Unlike ``clear_session()`` followed by
+        ``add_items()``, the old list and the new list are swapped in a single Redis
+        transaction: concurrent readers observe either the old history or the new
+        history, never an empty or partial one, and a crash leaves the previous
+        history in place.
+
+        Args:
+            items: The full history to store, replacing whatever was stored before.
+        """
+        async with self._lock:
+            self._check_not_closed()
+            serialized_items = []
+            for item in items:
+                serialized = await self._serialize_item(item)
+                serialized_items.append(serialized)
+
+            await self._mutate_items(serialized_items, replace=True)
 
     async def pop_item(self) -> TResponseInputItem | None:
         """Remove and return the most recent item from the session.

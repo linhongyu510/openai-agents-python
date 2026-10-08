@@ -546,6 +546,15 @@ class OpenAIResponsesCompactionSession(SessionABC, OpenAIResponsesCompactionAwar
         output_items: list[TResponseInputItem],
         previous_items: list[TResponseInputItem],
     ) -> None:
+        # Backends that can swap the whole history in one atomic operation (for
+        # example RedisSession) make the replacement all-or-nothing: concurrent
+        # readers never see an empty/partial window and a crash leaves the old
+        # history intact, so no restore dance is required.
+        atomic_replace = getattr(self.underlying_session, "_atomic_replace_items", None)
+        if atomic_replace is not None:
+            await atomic_replace(output_items)
+            return
+
         # Treat clear → add as one replacement transaction. Exception and CancelledError
         # both restore previous history, and restore settlement is always drained so a
         # cancel during restore cannot leave an empty session.
