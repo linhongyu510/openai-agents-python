@@ -1906,6 +1906,89 @@ class TestPtyExec:
             with pytest.raises(ExecTransportError):
                 await session.pty_exec_start("echo", "hello")
 
+    @pytest.mark.asyncio
+    async def test_pty_exec_start_settles_unregistered_cleanup_on_cancellation(
+        self, fake_sandbox: _FakeSandboxInstance
+    ) -> None:
+        from agents.extensions.sandbox.blaxel import sandbox as mod
+
+        session = _make_session(fake_sandbox)
+        connect_started = asyncio.Event()
+        cleanup_started = asyncio.Event()
+        release_cleanup = asyncio.Event()
+
+        class _BlockingHTTPSession:
+            closed = False
+
+            async def ws_connect(self, url: str) -> None:
+                connect_started.set()
+                await asyncio.Event().wait()
+
+            async def close(self) -> None:
+                cleanup_started.set()
+                await release_cleanup.wait()
+                self.closed = True
+
+        http_session = _BlockingHTTPSession()
+
+        class _BlockingAiohttp:
+            def ClientSession(self) -> _BlockingHTTPSession:
+                return http_session
+
+        with patch.object(mod, "_import_aiohttp", return_value=_BlockingAiohttp()):
+            task = asyncio.create_task(session.pty_exec_start("echo", "hello"))
+            await asyncio.wait_for(connect_started.wait(), timeout=1)
+            task.cancel()
+            await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+            task.cancel()
+            await asyncio.sleep(0)
+            assert not task.done()
+            release_cleanup.set()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, timeout=1)
+
+        assert http_session.closed
+
+    @pytest.mark.asyncio
+    async def test_pty_exec_start_settles_pruned_cleanup_on_cancellation(
+        self, fake_sandbox: _FakeSandboxInstance
+    ) -> None:
+        from agents.extensions.sandbox.blaxel import sandbox as mod
+        from agents.extensions.sandbox.blaxel.sandbox import _BlaxelPtySessionEntry
+
+        session = _make_session(fake_sandbox)
+        ws = _FakeWS()
+        pruned = _BlaxelPtySessionEntry("pruned", ws=None, http_session=None)
+        cleanup_started = asyncio.Event()
+        release_cleanup = asyncio.Event()
+        cleaned: list[_BlaxelPtySessionEntry] = []
+
+        async def blocked_cleanup(entry: _BlaxelPtySessionEntry) -> None:
+            cleanup_started.set()
+            await release_cleanup.wait()
+            cleaned.append(entry)
+
+        try:
+            with (
+                patch.object(mod, "_import_aiohttp", return_value=_FakeAiohttp(ws=ws)),
+                patch.object(session, "_prune_pty_sessions_if_needed", return_value=pruned),
+                patch.object(session, "_terminate_pty_entry", side_effect=blocked_cleanup),
+            ):
+                task = asyncio.create_task(session.pty_exec_start("echo", "hello"))
+                await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+                task.cancel()
+                await asyncio.sleep(0)
+                assert not task.done()
+                release_cleanup.set()
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.wait_for(task, timeout=1)
+        finally:
+            await session.pty_terminate_all()
+
+        assert cleaned[0] is pruned
+        assert len(cleaned) == 2
+        assert not session._pty_sessions
+
     @pytest.mark.parametrize(
         ("chars", "expected_send_count"),
         [
@@ -1974,6 +2057,59 @@ class TestPtyExec:
         assert len(session._pty_sessions) == 0
         assert len(session._reserved_pty_process_ids) == 0
         assert ws._closed
+
+    @pytest.mark.asyncio
+    async def test_pty_terminate_all_settles_cleanup_before_propagating_cancellation(
+        self, fake_sandbox: _FakeSandboxInstance
+    ) -> None:
+        from agents.extensions.sandbox.blaxel.sandbox import _BlaxelPtySessionEntry
+
+        session = _make_session(fake_sandbox)
+        entries = [
+            _BlaxelPtySessionEntry(f"term-{index}", ws=None, http_session=None)
+            for index in range(2)
+        ]
+        session._pty_sessions.update(enumerate(entries, start=1))
+        cleanup_started = asyncio.Event()
+        release_cleanup = asyncio.Event()
+        cleaned: list[_BlaxelPtySessionEntry] = []
+
+        async def blocked_cleanup(entry: _BlaxelPtySessionEntry) -> None:
+            cleanup_started.set()
+            await release_cleanup.wait()
+            cleaned.append(entry)
+
+        with patch.object(session, "_terminate_pty_entry", side_effect=blocked_cleanup):
+            task = asyncio.create_task(session.pty_terminate_all())
+            await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+            task.cancel()
+            await asyncio.sleep(0)
+            assert not task.done()
+            release_cleanup.set()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, timeout=1)
+
+        assert cleaned == entries
+
+    @pytest.mark.asyncio
+    async def test_pty_cleanup_error_takes_priority_over_caller_cancellation(self) -> None:
+        from agents.extensions.sandbox.blaxel.sandbox import _settle_pty_cleanup
+
+        cleanup_started = asyncio.Event()
+        release_cleanup = asyncio.Event()
+
+        async def failing_cleanup() -> None:
+            cleanup_started.set()
+            await release_cleanup.wait()
+            raise RuntimeError("cleanup failed")
+
+        task = asyncio.create_task(_settle_pty_cleanup(failing_cleanup()))
+        await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+        task.cancel()
+        release_cleanup.set()
+
+        with pytest.raises(RuntimeError, match="cleanup failed"):
+            await asyncio.wait_for(task, timeout=1)
 
     @pytest.mark.asyncio
     async def test_pty_ws_reader_error_message(self, fake_sandbox: _FakeSandboxInstance) -> None:
@@ -2052,6 +2188,85 @@ class TestPtyExec:
         assert result.process_id is None
         assert result.exit_code == 0
         assert 1 not in session._pty_sessions
+
+    @pytest.mark.asyncio
+    async def test_pty_finalize_settles_cleanup_before_propagating_cancellation(
+        self, fake_sandbox: _FakeSandboxInstance
+    ) -> None:
+        from agents.extensions.sandbox.blaxel.sandbox import _BlaxelPtySessionEntry
+
+        session = _make_session(fake_sandbox)
+        entry = _BlaxelPtySessionEntry(
+            ws_session_id="test-cancelled-finalize",
+            ws=None,
+            http_session=None,
+            done=True,
+            exit_code=0,
+        )
+        session._pty_sessions[1] = entry
+        cleanup_started = asyncio.Event()
+        release_cleanup = asyncio.Event()
+        cleaned: list[_BlaxelPtySessionEntry] = []
+
+        async def blocked_cleanup(target: _BlaxelPtySessionEntry) -> None:
+            cleanup_started.set()
+            await release_cleanup.wait()
+            cleaned.append(target)
+
+        with patch.object(session, "_terminate_pty_entry", side_effect=blocked_cleanup):
+            task = asyncio.create_task(
+                session._finalize_pty_update(
+                    process_id=1,
+                    entry=entry,
+                    output=b"",
+                    original_token_count=None,
+                )
+            )
+            await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+            assert 1 not in session._pty_sessions
+            task.cancel()
+            await asyncio.sleep(0)
+            assert not task.done()
+            release_cleanup.set()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, timeout=1)
+
+        assert cleaned == [entry]
+
+    @pytest.mark.asyncio
+    async def test_pty_finalize_does_not_terminate_reused_process_id(
+        self, fake_sandbox: _FakeSandboxInstance
+    ) -> None:
+        from agents.extensions.sandbox.blaxel.sandbox import _BlaxelPtySessionEntry
+
+        session = _make_session(fake_sandbox)
+        finished = _BlaxelPtySessionEntry(
+            ws_session_id="finished",
+            ws=None,
+            http_session=None,
+            done=True,
+            exit_code=0,
+        )
+        replacement = _BlaxelPtySessionEntry(
+            ws_session_id="replacement",
+            ws=None,
+            http_session=None,
+        )
+        session._pty_sessions[1] = replacement
+        session._reserved_pty_process_ids.add(1)
+
+        with patch.object(session, "_terminate_pty_entry", new_callable=AsyncMock) as terminate:
+            result = await session._finalize_pty_update(
+                process_id=1,
+                entry=finished,
+                output=b"",
+                original_token_count=None,
+            )
+
+        assert result.process_id is None
+        assert session._pty_sessions[1] is replacement
+        assert 1 in session._reserved_pty_process_ids
+        terminate.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_pty_prune_sessions(self, fake_sandbox: _FakeSandboxInstance) -> None:

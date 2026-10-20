@@ -21,6 +21,7 @@ import shlex
 import time
 import uuid
 from collections import deque
+from collections.abc import Coroutine
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -313,6 +314,21 @@ class _BlaxelPtySessionEntry:
     done: bool = False
     exit_code: int | None = None
     reader_task: asyncio.Task[None] | None = None
+
+
+async def _settle_pty_cleanup(operation: Coroutine[Any, Any, None]) -> None:
+    task = asyncio.create_task(operation, name="agents.blaxel_pty_cleanup")
+    completion = asyncio.create_task(asyncio.wait((task,)))
+    caller_cancelled = False
+    while not completion.done():
+        try:
+            await asyncio.shield(completion)
+        except asyncio.CancelledError:
+            caller_cancelled = True
+    completion.result()
+    task.result()
+    if caller_cancelled:
+        raise asyncio.CancelledError() from None
 
 
 # ---------------------------------------------------------------------------
@@ -839,34 +855,48 @@ class BlaxelSandboxSession(BaseSandboxSession):
                 registered = True
         except asyncio.TimeoutError as e:
             if not registered:
-                await self._terminate_pty_entry(entry)
+                await _settle_pty_cleanup(self._terminate_pty_entry(entry))
             raise ExecTimeoutError(command=command, timeout_s=exec_timeout, cause=e) from e
+        except asyncio.CancelledError:
+            if not registered:
+                await _settle_pty_cleanup(self._terminate_pty_entry(entry))
+            raise
         except Exception as e:
             if not registered:
-                await self._terminate_pty_entry(entry)
+                await _settle_pty_cleanup(self._terminate_pty_entry(entry))
             raise _blaxel_exec_transport_error(command=command, cause=e) from e
 
-        if pruned is not None:
-            await self._terminate_pty_entry(pruned)
+        try:
+            if pruned is not None:
+                await _settle_pty_cleanup(self._terminate_pty_entry(pruned))
 
-        if process_count >= PTY_PROCESSES_WARNING:
-            logger.warning(
-                "PTY process count reached warning threshold: %s active sessions",
-                process_count,
+            if process_count >= PTY_PROCESSES_WARNING:
+                logger.warning(
+                    "PTY process count reached warning threshold: %s active sessions",
+                    process_count,
+                )
+
+            yield_time_ms = 10_000 if yield_time_s is None else int(yield_time_s * 1000)
+            output, original_token_count = await self._collect_pty_output(
+                entry=entry,
+                yield_time_ms=clamp_pty_yield_time_ms(yield_time_ms),
+                max_output_tokens=max_output_tokens,
             )
-
-        yield_time_ms = 10_000 if yield_time_s is None else int(yield_time_s * 1000)
-        output, original_token_count = await self._collect_pty_output(
-            entry=entry,
-            yield_time_ms=clamp_pty_yield_time_ms(yield_time_ms),
-            max_output_tokens=max_output_tokens,
-        )
-        return await self._finalize_pty_update(
-            process_id=process_id,
-            entry=entry,
-            output=output,
-            original_token_count=original_token_count,
-        )
+            return await self._finalize_pty_update(
+                process_id=process_id,
+                entry=entry,
+                output=output,
+                original_token_count=original_token_count,
+            )
+        except asyncio.CancelledError:
+            async with self._pty_lock:
+                removed = None
+                if self._pty_sessions.get(process_id) is entry:
+                    removed = self._pty_sessions.pop(process_id)
+                    self._reserved_pty_process_ids.discard(process_id)
+            if removed is not None:
+                await _settle_pty_cleanup(self._terminate_pty_entry(removed))
+            raise
 
     async def pty_write_stdin(
         self,
@@ -910,8 +940,12 @@ class BlaxelSandboxSession(BaseSandboxSession):
             entries = list(self._pty_sessions.values())
             self._pty_sessions.clear()
             self._reserved_pty_process_ids.clear()
-        for entry in entries:
-            await self._terminate_pty_entry(entry)
+
+        async def cleanup_all() -> None:
+            for entry in entries:
+                await self._terminate_pty_entry(entry)
+
+        await _settle_pty_cleanup(cleanup_all())
 
     # -- PTY internals -------------------------------------------------------
 
@@ -987,10 +1021,12 @@ class BlaxelSandboxSession(BaseSandboxSession):
 
         if entry.done:
             async with self._pty_lock:
-                removed = self._pty_sessions.pop(process_id, None)
-                self._reserved_pty_process_ids.discard(process_id)
+                removed = None
+                if self._pty_sessions.get(process_id) is entry:
+                    removed = self._pty_sessions.pop(process_id)
+                    self._reserved_pty_process_ids.discard(process_id)
             if removed is not None:
-                await self._terminate_pty_entry(removed)
+                await _settle_pty_cleanup(self._terminate_pty_entry(removed))
             live_process_id = None
 
         return PtyExecUpdate(
