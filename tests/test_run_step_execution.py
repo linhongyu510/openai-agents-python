@@ -3207,7 +3207,7 @@ async def get_execute_result(
         output_schema=output_schema,
         handoffs=handoffs,
     )
-    return await run_loop.execute_tools_and_side_effects(
+    result = await run_loop.execute_tools_and_side_effects(
         bindings=_bind_agent(agent),
         original_input=original_input or "hello",
         new_response=response,
@@ -3218,6 +3218,10 @@ async def get_execute_result(
         context_wrapper=context_wrapper or RunContextWrapper(None),
         run_config=run_config or RunConfig(),
     )
+    # The runner propagates batch failures after saving any accepted sibling outputs.
+    if result.tool_execution_error is not None:
+        raise result.tool_execution_error
+    return result
 
 
 async def run_execute_with_processed_response(

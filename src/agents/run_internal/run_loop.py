@@ -2208,6 +2208,12 @@ async def start_streaming(
                         store_setting,
                     )
 
+                    if turn_result.tool_execution_error is not None:
+                        _mark_error_to_drain_stream_events(turn_result.tool_execution_error)
+                        if isinstance(turn_result.tool_execution_error, asyncio.CancelledError):
+                            streamed_result._stored_exception = turn_result.tool_execution_error
+                        raise turn_result.tool_execution_error
+
                     if await _wait_for_streamed_turn_events_and_stop_if_cancelled(streamed_result):
                         break
             except Exception as e:
@@ -2648,6 +2654,12 @@ async def run_single_turn_streamed(
         before_side_effects=check_input_guardrails_before_side_effects,
         run_state=run_state,
     )
+
+    if single_step_result.tool_execution_error is not None:
+        # A completed speculative tool must not enter recoverable history before input admission.
+        if streamed_result._input_guardrails_task is not None:
+            await streamed_result._input_guardrails_task
+        await raise_if_input_guardrail_tripwire_known()
 
     items_to_filter = session_items_for_turn(single_step_result)
 

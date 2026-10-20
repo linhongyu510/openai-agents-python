@@ -238,6 +238,9 @@ class SingleStepResult:
     has_recovered_tool_outputs: bool = False
     """Whether this step delivers outputs checkpointed before a failed callback."""
 
+    tool_execution_error: BaseException | None = None
+    """Failure to propagate after admitting and persisting completed tool outputs."""
+
     @property
     def generated_items(self) -> list[RunItem]:
         """Items generated during the agent run (i.e. everything generated after

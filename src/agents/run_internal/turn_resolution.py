@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
 from collections.abc import Awaitable, Callable, Container, Mapping, Sequence
 from copy import deepcopy
@@ -126,7 +127,7 @@ from ..util._approvals import evaluate_needs_approval_setting
 from ..util._asyncio_tasks import gather_with_cancel
 from .agent_bindings import AgentBindings
 from .agent_tool_configuration import register_agent_tool_configuration
-from .blocked_output import _current_response_boundary
+from .blocked_output import _current_response_boundary, _should_defer_interrupted_session_items
 from .error_handlers import (
     build_run_error_data,
     create_message_output_item,
@@ -861,8 +862,11 @@ async def execute_tools_and_side_effects(
     tool_output_guardrail_results: list[ToolOutputGuardrailResult] = []
     prior_input_results = list(run_state._tool_input_guardrail_results) if run_state else []
     prior_output_results = list(run_state._tool_output_guardrail_results) if run_state else []
+    accepted_tool_outputs: dict[str, ToolCallOutputItem] = {}
 
     def _commit_accepted_response_tool_output(item: RunItem) -> None:
+        if isinstance(item, ToolCallOutputItem) and item.call_id is not None:
+            accepted_tool_outputs[item.call_id] = item
         if run_state is None or not isinstance(run_state._current_step, NextStepInterruption):
             return
         if not run_state._current_step.response_accepted:
@@ -883,25 +887,81 @@ async def execute_tools_and_side_effects(
             *tool_output_guardrail_results,
         ]
 
-    (
-        function_results,
-        tool_input_guardrail_results,
-        tool_output_guardrail_results,
-        computer_results,
-        custom_tool_results,
-        shell_results,
-        apply_patch_results,
-        local_shell_results,
-    ) = await _execute_tool_plan(
-        plan=plan,
-        bindings=bindings,
-        hooks=hooks,
-        context_wrapper=context_wrapper,
-        run_config=run_config,
-        tool_output_committer=_commit_accepted_response_tool_output,
-        tool_input_guardrail_results=tool_input_guardrail_results,
-        tool_output_guardrail_results=tool_output_guardrail_results,
+    tool_plan_task = asyncio.create_task(
+        _execute_tool_plan(
+            plan=plan,
+            bindings=bindings,
+            hooks=hooks,
+            context_wrapper=context_wrapper,
+            run_config=run_config,
+            tool_output_committer=_commit_accepted_response_tool_output,
+            tool_input_guardrail_results=tool_input_guardrail_results,
+            tool_output_guardrail_results=tool_output_guardrail_results,
+        )
     )
+    try:
+        # Waiting separately distinguishes parent cancellation from a tool's CancelledError,
+        # including on Python 3.10 where Task.cancelling() is unavailable.
+        await asyncio.wait((tool_plan_task,))
+    except BaseException:
+        tool_plan_task.cancel()
+        await asyncio.gather(tool_plan_task, return_exceptions=True)
+        raise
+    try:
+        (
+            function_results,
+            tool_input_guardrail_results,
+            tool_output_guardrail_results,
+            computer_results,
+            custom_tool_results,
+            shell_results,
+            apply_patch_results,
+            local_shell_results,
+        ) = tool_plan_task.result()
+    except (Exception, asyncio.CancelledError) as error:
+        # Server-owned responses use their existing accepted-response checkpoint. Outputs that
+        # could become guarded terminal results must remain behind the final-output gate.
+        if (
+            not accepted_tool_outputs
+            or server_manages_conversation
+            or _should_defer_interrupted_session_items(public_agent, run_config)
+        ):
+            raise
+        completed_items: list[RunItem] = []
+        completed_outputs: list[RunItem] = []
+        retain_reasoning = False
+        for item in reversed(new_step_items):
+            if isinstance(item, ReasoningItem):
+                if retain_reasoning:
+                    completed_items.append(item)
+                continue
+            retain_reasoning = False
+            if (
+                isinstance(item, ToolCallItem)
+                and isinstance(item.raw_item, ResponseFunctionToolCall)
+                and get_mapping_or_attr(get_mapping_or_attr(item.raw_item, "caller"), "type")
+                != "program"
+                and (output := accepted_tool_outputs.get(item.raw_item.call_id)) is not None
+            ):
+                completed_items.append(item)
+                completed_outputs.append(output)
+                retain_reasoning = True
+        if not completed_outputs:
+            raise
+        completed_items.reverse()
+        completed_outputs.reverse()
+        completed_items.extend(completed_outputs)
+        _register_tool_call_items(context_wrapper, completed_items)
+        return SingleStepResult(
+            original_input=original_input,
+            model_response=new_response,
+            pre_step_items=pre_step_items,
+            new_step_items=completed_items,
+            next_step=NextStepRunAgain(),
+            tool_input_guardrail_results=tool_input_guardrail_results,
+            tool_output_guardrail_results=tool_output_guardrail_results,
+            tool_execution_error=error,
+        )
     new_step_items.extend(
         _build_tool_result_items(
             function_results=function_results,

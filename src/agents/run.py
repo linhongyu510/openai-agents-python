@@ -1998,6 +1998,8 @@ class AgentRunner:
                     is_resumed_state = False
 
                     try:
+                        if turn_result.tool_execution_error is not None:
+                            raise turn_result.tool_execution_error
                         if isinstance(turn_result.next_step, NextStepFinalOutput):
                             if run_state is not None and _has_output_guardrails(
                                 current_agent, run_config
